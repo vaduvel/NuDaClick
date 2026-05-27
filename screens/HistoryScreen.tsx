@@ -19,6 +19,7 @@ import {
   ArrowRight,
   ShieldQuestion
 } from 'lucide-react-native';
+import { getDisplayRiskBadgeLabel, getDisplayRiskToken, normalizeRiskLevelForDisplay } from '../theme';
 
 interface HistoryScreenProps {
   onSelectScan: (result: any) => void;
@@ -83,35 +84,22 @@ export default function HistoryScreen({ onSelectScan, onNavigateToScan }: Histor
   };
 
   const getRiskColor = (level: string) => {
-    switch (level?.toLowerCase()) {
-      case 'critical':
-        return '#EF4444';
-      case 'high':
-        return '#F59E0B';
-      case 'medium':
-        return '#EAB308';
-      case 'low':
-      case 'safe':
-        return '#10B981';
-      default:
-        return '#3B82F6';
-    }
+    return getDisplayRiskToken(normalizeRiskLevelForDisplay(level)).main;
   };
 
   const getRiskIcon = (level: string) => {
     const size = 18;
-    switch (level?.toLowerCase()) {
-      case 'critical':
-        return <ShieldAlert size={size} color="#EF4444" />;
-      case 'high':
-      case 'medium':
-        return <AlertTriangle size={size} color={level === 'high' ? '#F59E0B' : '#EAB308'} />;
-      case 'low':
-      case 'safe':
-        return <ShieldCheck size={size} color="#10B981" />;
-      default:
-        return <ShieldQuestion size={size} color="#3B82F6" />;
+    const displayLevel = normalizeRiskLevelForDisplay(level);
+    if (displayLevel === 'dangerous') {
+      return <ShieldAlert size={size} color={getDisplayRiskToken(displayLevel).main} />;
     }
+    if (displayLevel === 'suspect') {
+      return <AlertTriangle size={size} color={getDisplayRiskToken(displayLevel).main} />;
+    }
+    if (displayLevel === 'safe') {
+      return <ShieldCheck size={size} color={getDisplayRiskToken(displayLevel).main} />;
+    }
+    return <ShieldQuestion size={size} color={getDisplayRiskToken(displayLevel).main} />;
   };
 
   const formatDate = (isoString: string) => {
@@ -130,23 +118,13 @@ export default function HistoryScreen({ onSelectScan, onNavigateToScan }: Histor
   };
 
   const getVerdictLabel = (level: string) => {
-    switch (level?.toLowerCase()) {
-      case 'critical':
-      case 'high':
-        return 'PERICULOS';
-      case 'medium':
-        return 'SUSPECT';
-      case 'low':
-      case 'safe':
-        return 'SIGUR';
-      default:
-        return 'NECUNOSCUT';
-    }
+    return getDisplayRiskBadgeLabel(level);
   };
 
   const renderItem = ({ item }: { item: any }) => {
-    const riskColor = getRiskColor(item.risk_level);
-    const verdictLabel = getVerdictLabel(item.risk_level);
+    const displayLevel = item.user_risk_level || item.risk_level;
+    const riskColor = getRiskColor(displayLevel);
+    const verdictLabel = getVerdictLabel(displayLevel);
     
     return (
       <View style={styles.cardContainer}>
@@ -156,9 +134,9 @@ export default function HistoryScreen({ onSelectScan, onNavigateToScan }: Histor
         >
           <View style={styles.cardHeader}>
             <View style={styles.riskBadge}>
-              {getRiskIcon(item.risk_level)}
+              {getRiskIcon(displayLevel)}
               <Text style={[styles.riskText, { color: riskColor }]}>
-                {verdictLabel} ({item.risk_score}/100)
+                {verdictLabel}
               </Text>
             </View>
             <Text style={styles.dateText}>{formatDate(item.timestamp)}</Text>

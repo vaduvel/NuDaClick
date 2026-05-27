@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, Text, StyleSheet, ViewStyle } from 'react-native';
 import { Colors, Typography, Spacing, Radius } from '../theme';
-import { getRiskToken, getRiskBadgeLabel } from '../theme';
+import { getDisplayRiskToken, getDisplayRiskBadgeLabel } from '../theme';
 
 // ─── Types ───────────────────────────────────────────────────────────
 type BadgeVariant = 'risk' | 'info' | 'channel' | 'custom';
@@ -42,8 +42,8 @@ export default function DSBadge({
   let borderColor  = Colors.brandBorder;
 
   if (variant === 'risk' && riskLevel) {
-    const tok   = getRiskToken(riskLevel);
-    displayLabel = label ?? getRiskBadgeLabel(riskLevel);
+    const tok   = getDisplayRiskToken(riskLevel);
+    displayLabel = label ?? getDisplayRiskBadgeLabel(riskLevel);
     mainColor    = tok.main;
     bgColor      = tok.bg;
     borderColor  = tok.border;

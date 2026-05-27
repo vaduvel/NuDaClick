@@ -1,15 +1,21 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "NuDaClick",
+    "slug": "nudaclick",
+    "scheme": "nudaclick",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "bundleIdentifier": "ro.nudaclick.app",
+      "supportsTablet": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
+      "package": "ro.nudaclick.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -20,6 +26,40 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permite aplicației NuDaClick să folosească camera pentru scanarea sigură a codurilor QR.",
+          "barcodeScannerEnabled": true
+        }
+      ],
+      [
+        "expo-sharing",
+        {
+          "android": {
+            "enabled": true,
+            "singleShareMimeTypes": [
+              "text/plain",
+              "text/html",
+              "text/*",
+              "text/uri-list",
+              "image/*",
+              "application/pdf",
+              "message/rfc822",
+              "application/vnd.ms-outlook",
+              "application/octet-stream"
+            ]
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2f65ab1c-f936-42ba-b000-1111a4409199"
+      }
+    },
+    "owner": "vaduvel"
   }
 }

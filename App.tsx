@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import {
   StyleSheet,
@@ -14,6 +14,7 @@ import {
   Flame,
   Info,
   ShieldAlert,
+  BarChart3,
 } from 'lucide-react-native';
 
 import ScanScreen from './screens/ScanScreen';
@@ -21,6 +22,9 @@ import ResultScreen from './screens/ResultScreen';
 import TriageScreen from './screens/TriageScreen';
 import HistoryScreen from './screens/HistoryScreen';
 import AboutScreen from './screens/AboutScreen';
+import ReadinessScreen from './screens/ReadinessScreen';
+import { useShareIntake } from './hooks/useShareIntake';
+import type { IncomingShareRequest } from './hooks/shareIntake.types';
 
 // Simple state-based router (avoids react-navigation native peer deps for web compat)
 type Screen =
@@ -28,13 +32,20 @@ type Screen =
   | { name: 'result'; params: { result: any } }
   | { name: 'triage'; params?: { category?: string } }
   | { name: 'history' }
+  | { name: 'reports' }
   | { name: 'about' };
 
-type TabKey = 'scan' | 'history' | 'triage' | 'about';
+type TabKey = 'scan' | 'history' | 'triage' | 'reports' | 'about';
+
+const LIVE_BACKEND_URL = 'https://nudaclick-backend.vercel.app';
 
 const resolveBackendUrl = () => {
   if (process.env.EXPO_PUBLIC_BACKEND_URL) {
     return process.env.EXPO_PUBLIC_BACKEND_URL;
+  }
+
+  if (!__DEV__) {
+    return LIVE_BACKEND_URL;
   }
 
   if (Platform.OS === 'android') {
@@ -49,6 +60,14 @@ const BACKEND_URL = resolveBackendUrl();
 export default function App() {
   const [currentScreen, setCurrentScreen] = useState<Screen>({ name: 'scan' });
   const [activeTab, setActiveTab] = useState<TabKey>('scan');
+  const [incomingShareRequest, setIncomingShareRequest] = useState<IncomingShareRequest | null>(null);
+  const {
+    sharedPayloads,
+    resolvedSharedPayloads,
+    clearSharedPayloads,
+    isResolving: isResolvingIncomingShare,
+    error: incomingShareError,
+  } = useShareIntake();
 
   // Navigation handlers
   const navigateToResult = useCallback((result: any) => {
@@ -75,6 +94,40 @@ export default function App() {
     setCurrentScreen({ name: 'about' });
   }, []);
 
+  const navigateToReports = useCallback(() => {
+    setActiveTab('reports');
+    setCurrentScreen({ name: 'reports' });
+  }, []);
+
+  const handleIncomingShareHandled = useCallback(() => {
+    clearSharedPayloads();
+    setIncomingShareRequest(null);
+  }, [clearSharedPayloads]);
+
+  useEffect(() => {
+    if (isResolvingIncomingShare || incomingShareRequest) {
+      return;
+    }
+
+    if (!sharedPayloads.length && !resolvedSharedPayloads.length) {
+      return;
+    }
+
+    setActiveTab('scan');
+    setCurrentScreen({ name: 'scan' });
+    setIncomingShareRequest({
+      id: Date.now(),
+      sharedPayloads: sharedPayloads.map((payload) => ({ ...payload })),
+      resolvedSharedPayloads: resolvedSharedPayloads.map((payload) => ({ ...payload })),
+    });
+  }, [incomingShareRequest, isResolvingIncomingShare, resolvedSharedPayloads, sharedPayloads]);
+
+  useEffect(() => {
+    if (incomingShareError) {
+      console.warn('Incoming share could not be resolved', incomingShareError);
+    }
+  }, [incomingShareError]);
+
   const handleTabPress = useCallback((tab: TabKey) => {
     setActiveTab(tab);
     switch (tab) {
@@ -86,6 +139,9 @@ export default function App() {
         break;
       case 'triage':
         setCurrentScreen({ name: 'triage' });
+        break;
+      case 'reports':
+        setCurrentScreen({ name: 'reports' });
         break;
       case 'about':
         setCurrentScreen({ name: 'about' });
@@ -101,6 +157,8 @@ export default function App() {
           <ScanScreen
             onScanComplete={navigateToResult}
             backendUrl={BACKEND_URL}
+            incomingShareRequest={incomingShareRequest}
+            onIncomingShareHandled={handleIncomingShareHandled}
           />
         );
       case 'result':
@@ -109,6 +167,7 @@ export default function App() {
             result={currentScreen.params.result}
             onBack={navigateToScan}
             onNavigateToTriage={navigateToTriage}
+            backendUrl={BACKEND_URL}
           />
         );
       case 'triage':
@@ -125,6 +184,8 @@ export default function App() {
             onNavigateToScan={navigateToScan}
           />
         );
+      case 'reports':
+        return <ReadinessScreen backendUrl={BACKEND_URL} />;
       case 'about':
         return <AboutScreen />;
       default:
@@ -147,6 +208,11 @@ export default function App() {
       key: 'triage',
       label: 'Urgență',
       icon: (active) => <Flame size={20} color={active ? '#EF4444' : '#6B7280'} />,
+    },
+    {
+      key: 'reports',
+      label: 'Rapoarte',
+      icon: (active) => <BarChart3 size={20} color={active ? '#10B981' : '#6B7280'} />,
     },
     {
       key: 'about',
@@ -181,7 +247,12 @@ export default function App() {
                   style={[
                     styles.tabLabel,
                     isActive && {
-                      color: tab.key === 'triage' ? '#EF4444' : '#3B82F6',
+                      color:
+                        tab.key === 'triage'
+                          ? '#EF4444'
+                          : tab.key === 'reports'
+                            ? '#10B981'
+                            : '#3B82F6',
                       fontWeight: '700',
                     },
                   ]}
@@ -192,7 +263,14 @@ export default function App() {
                   <View
                     style={[
                       styles.activeIndicator,
-                      { backgroundColor: tab.key === 'triage' ? '#EF4444' : '#3B82F6' },
+                      {
+                        backgroundColor:
+                          tab.key === 'triage'
+                            ? '#EF4444'
+                            : tab.key === 'reports'
+                              ? '#10B981'
+                              : '#3B82F6',
+                      },
                     ]}
                   />
                 )}

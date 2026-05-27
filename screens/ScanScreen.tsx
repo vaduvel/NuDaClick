@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -11,14 +11,32 @@ import {
   Platform,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { Clipboard, ShieldAlert, Sparkles, Image as ImageIcon, QrCode, ArrowRight } from 'lucide-react-native';
+import * as DocumentPicker from 'expo-document-picker';
+import { Clipboard, ShieldAlert, Sparkles, Image as ImageIcon, QrCode, ArrowRight, Mail } from 'lucide-react-native';
+import { getDisplayRiskBadgeLabel, normalizeRiskLevelForDisplay } from '../theme';
+import QRScannerModal from '../components/QRScannerModal';
+import type {
+  IncomingShareRawPayload,
+  IncomingShareRequest,
+  IncomingShareResolvedPayload,
+} from '../hooks/shareIntake.types';
 
 interface ScanScreenProps {
   onScanComplete: (result: any) => void;
   backendUrl: string;
+  incomingShareRequest?: IncomingShareRequest | null;
+  onIncomingShareHandled?: () => void;
 }
 
-type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
+type RiskLevel = 'low' | 'medium' | 'high';
+
+type PickedImageAsset = ImagePicker.ImagePickerAsset & {
+  file?: File;
+};
+
+type PickedDocumentAsset = DocumentPicker.DocumentPickerAsset & {
+  file?: File;
+};
 
 interface OfflineRule {
   id: string;
@@ -286,10 +304,47 @@ const hasSuspiciousTld = (domain: string) =>
 
 const isIpAddress = (domain: string) => /\b\d{1,3}(?:\.\d{1,3}){3}\b/.test(domain);
 
+const filenameFromUri = (uri: string, fallback = 'screenshot.jpg') => {
+  const withoutQuery = uri.split('?')[0];
+  return withoutQuery.split('/').pop() || fallback;
+};
+
+const mimeTypeFromFilename = (filename: string) => {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  if (ext === 'eml') return 'message/rfc822';
+  if (ext === 'msg') return 'application/vnd.ms-outlook';
+  if (ext === 'pdf') return 'application/pdf';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  return 'image/jpeg';
+};
+
+const isEmlFilename = (filename: string) => filename.toLowerCase().endsWith('.eml');
+const isPdfFilename = (filename: string) => filename.toLowerCase().endsWith('.pdf');
+const isHtmlFilename = (filename: string) =>
+  filename.toLowerCase().endsWith('.html') || filename.toLowerCase().endsWith('.htm');
+const looksLikeUrl = (value: string) => /^(https?:\/\/|www\.)\S+$/i.test(value.trim());
+const normalizeSharedUrl = (value: string) =>
+  value.trim().startsWith('http') ? value.trim() : `https://${value.trim()}`;
+
+const isSingleUrlText = (value: string) => {
+  const trimmed = value.trim();
+  return looksLikeUrl(trimmed) && !/\s/.test(trimmed);
+};
+
+const normalizeMime = (value?: string) => (value || '').toLowerCase();
+
+const isTextMimeType = (mimeType?: string) => {
+  const normalized = normalizeMime(mimeType);
+  return normalized.startsWith('text/') || normalized === 'application/json';
+};
+
+const isHtmlMimeType = (mimeType?: string) => {
+  const normalized = normalizeMime(mimeType);
+  return normalized.includes('html');
+};
+
 const evaluateRiskLevel = (score: number): RiskLevel => {
-  if (score >= 85) {
-    return 'critical';
-  }
   if (score >= 70) {
     return 'high';
   }
@@ -469,10 +524,135 @@ const evaluateOfflineText = (scannedText: string): OfflineAssessment => {
   };
 };
 
-export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenProps) {
+type UploadableFile = {
+  uri: string;
+  name: string;
+  type?: string | null;
+  webFile?: File;
+};
+
+const buildUploadableFile = (input: {
+  uri: string;
+  name?: string | null;
+  type?: string | null;
+  webFile?: File;
+}): UploadableFile => {
+  const name = input.name || filenameFromUri(input.uri, 'shared-file');
+  return {
+    uri: input.uri,
+    name,
+    type: input.type || mimeTypeFromFilename(name),
+    webFile: input.webFile,
+  };
+};
+
+export default function ScanScreen({
+  onScanComplete,
+  backendUrl,
+  incomingShareRequest,
+  onIncomingShareHandled,
+}: ScanScreenProps) {
   const [text, setText] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState('');
+  const [isQrScannerVisible, setIsQrScannerVisible] = useState(false);
+
+  const appendUploadToFormData = async (
+    formData: FormData,
+    fieldName: string,
+    file: UploadableFile
+  ) => {
+    if (Platform.OS === 'web') {
+      if (file.webFile) {
+        formData.append(fieldName, file.webFile, file.name);
+        return;
+      }
+
+      const fileResponse = await fetch(file.uri);
+      const blob = await fileResponse.blob();
+      formData.append(fieldName, blob, file.name);
+      return;
+    }
+
+    // @ts-ignore React Native FormData accepts the { uri, name, type } shape.
+    formData.append(fieldName, {
+      uri: file.uri,
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+    });
+  };
+
+  const readTextFromUri = async (uri: string) => {
+    try {
+      const response = await fetch(uri);
+      if (!response.ok) {
+        return null;
+      }
+
+      const text = await response.text();
+      return text;
+    } catch (err) {
+      console.log('Cannot read shared content as text', err);
+      return null;
+    }
+  };
+
+  const readSharedTextPayload = async (payload: IncomingShareResolvedPayload) => {
+    const sharedText = payload.value?.trim();
+    if (sharedText) {
+      return sharedText;
+    }
+
+    const sharedUri = payload.contentUri;
+    if (!sharedUri) {
+      return null;
+    }
+
+    return readTextFromUri(sharedUri);
+  };
+
+  const submitUrlScan = async (
+    scannedUrl: string,
+    sourceChannel = 'manual',
+    offlineFallback = true,
+    customLoadingMsg = 'Analizăm linkul direct...'
+  ) => {
+    const normalizedUrl = normalizeSharedUrl(scannedUrl);
+    setText(normalizedUrl);
+    setLoading(true);
+    setLoadingMsg(customLoadingMsg);
+
+    try {
+      const response = await fetch(`${backendUrl}/v1/scan/url`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          url: normalizedUrl,
+          source_channel: sourceChannel,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Eroare la verificarea URL-ului.');
+      }
+
+      const data = await response.json();
+      onScanComplete(data);
+      return true;
+    } catch (err: any) {
+      if (offlineFallback) {
+        Alert.alert('Atenție', 'Nu s-a putut verifica linkul direct. Rulăm scanarea offline.');
+        simulateOfflineScan(normalizedUrl);
+      } else {
+        Alert.alert('Scanare indisponibilă', String(err?.message || 'Nu am putut analiza acest link acum.'));
+      }
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handlePaste = async () => {
     // In React Native Web, Clipboard might be different. We handle it safely.
@@ -489,14 +669,24 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
     }
   };
 
-  const handleScanText = async () => {
-    if (!text.trim()) {
+  const submitTextScan = async (
+    scannedText: string,
+    sourceChannel = 'manual',
+    offlineFallback = true,
+    customLoadingMsg = 'Analizăm textul și link-urile...'
+  ) => {
+    if (!scannedText.trim()) {
       Alert.alert('Eroare', 'Vă rugăm să introduceți sau să lipiți un text suspect.');
-      return;
+      return false;
     }
 
+    if (isSingleUrlText(scannedText)) {
+      return submitUrlScan(scannedText, sourceChannel, offlineFallback, 'Verificăm linkul partajat direct...');
+    }
+
+    setText(scannedText);
     setLoading(true);
-    setLoadingMsg('Analizăm textul și link-urile...');
+    setLoadingMsg(customLoadingMsg);
 
     try {
       const response = await fetch(`${backendUrl}/v1/scan/text`, {
@@ -505,8 +695,8 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          text: text,
-          source_channel: 'manual',
+          text: scannedText,
+          source_channel: sourceChannel,
         }),
       });
 
@@ -516,32 +706,218 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
 
       const data = await response.json();
       onScanComplete(data);
+      return true;
     } catch (err: any) {
-      Alert.alert('Atenție', 'Nu s-a putut conecta la motorul de scanare local. Rulăm scanarea offline locală.');
-      // Mock local offline check if server is not running
-      simulateOfflineScan(text);
+      if (offlineFallback) {
+        Alert.alert('Atenție', 'Nu s-a putut conecta la motorul de scanare local. Rulăm scanarea offline locală.');
+        simulateOfflineScan(scannedText);
+      } else {
+        Alert.alert('Scanare indisponibilă', String(err?.message || 'Nu am putut analiza acest mesaj acum.'));
+      }
+      return false;
     } finally {
       setLoading(false);
     }
   };
 
+  const submitEmailScanFromHtml = async (htmlContent: string, sourceChannel = 'email_html_upload') => {
+    setLoading(true);
+    setLoadingMsg('Citim conținutul HTML partajat și căutăm butoanele ascunse...');
+
+    try {
+      const formData = new FormData();
+      formData.append('source_channel', sourceChannel);
+      formData.append('html_content', htmlContent);
+
+      const response = await fetch(`${backendUrl}/v1/scan/email`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        throw new Error(responseText || 'Eroare la scanarea emailului HTML.');
+      }
+
+      const data = await response.json();
+      onScanComplete(data);
+      return true;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleScanText = async () => {
+    await submitTextScan(text);
+  };
+
   const simulateOfflineScan = (scannedText: string) => {
     const assessment = evaluateOfflineText(scannedText);
+    const userRiskLevel = normalizeRiskLevelForDisplay(assessment.riskLevel);
+    const userRiskLabel = getDisplayRiskBadgeLabel(userRiskLevel);
 
     onScanComplete({
       scan_id: `offline_${Math.random().toString(36).substring(4)}`,
       risk_score: assessment.riskScore,
       risk_level: assessment.riskLevel,
+      user_risk_level: userRiskLevel,
+      user_risk_label: userRiskLabel,
       detected_family: assessment.family,
       claimed_brand: assessment.claimedBrand,
       reasons: assessment.reasons,
       redacted_text: scannedText,
-      ai_verdict: `Alerte offline: scor de risc ${assessment.riskScore}/100 (${assessment.riskLevel.toUpperCase()})`,
+      ai_verdict: `Alertă offline: status ${userRiskLabel}`,
       ai_explanation: 'Detecție locală offline bazată pe reguli. Pentru o analiză completă verificați backend-ul.',
       key_dangers: assessment.keyDangers,
       safe_actions: assessment.safeActions,
       evidence: assessment.evidence,
     });
+  };
+
+  const showImageScanUnavailableResult = (message?: string) => {
+    const userRiskLevel = normalizeRiskLevelForDisplay('medium');
+    const userRiskLabel = getDisplayRiskBadgeLabel(userRiskLevel);
+
+    onScanComplete({
+      scan_id: `ocr_unavailable_${Math.random().toString(36).substring(4)}`,
+      risk_score: 30,
+      risk_level: 'medium',
+      user_risk_level: userRiskLevel,
+      user_risk_label: userRiskLabel,
+      user_risk_text: 'Nu am putut verifica poza complet',
+      user_recommended_action:
+        'Nu apăsați pe linkuri din poză până nu trimiteți textul copiat sau captura poate fi citită prin OCR.',
+      detected_family: 'Verificare OCR incompletă',
+      claimed_brand: 'Necunoscut',
+      reasons: [
+        'Nu s-a putut extrage text real din imagine în acest moment.',
+        message || 'Motorul OCR nu a răspuns pentru această scanare.',
+      ],
+      redacted_text: '',
+      ocr_extracted_text: '',
+      ai_verdict: `Scanare parțială: status ${userRiskLabel}`,
+      ai_explanation:
+        'Imaginea nu a primit un verdict complet. Pentru detecție reală, încercați din nou după ce OCR-ul este disponibil sau lipiți textul mesajului.',
+      key_dangers: ['Linkul real din poză poate duce către o pagină falsă.'],
+      safe_actions: [
+        'Nu deschideți linkul din imagine.',
+        'Copiați textul mesajului și rulați scanarea pe text.',
+        'Verificați doar în aplicația sau site-ul oficial al brandului menționat.',
+      ],
+      evidence: {
+        extracted_urls: [],
+      },
+      warning: 'OCR indisponibil pentru această imagine.',
+    });
+  };
+
+  const submitImageScan = async (file: UploadableFile, sourceChannel = 'image_upload') => {
+    setLoading(true);
+    setLoadingMsg('Extragem textul din screenshot prin OCR...');
+
+    try {
+      const formData = new FormData();
+      formData.append('source_channel', sourceChannel);
+      await appendUploadToFormData(formData, 'image_file', file);
+
+      const response = await fetch(`${backendUrl}/v1/scan/image`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error('Eroare la scanarea imaginii.');
+      }
+
+      const data = await response.json();
+      onScanComplete(data);
+      return true;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitEmailScan = async (file: UploadableFile, sourceChannel = 'email_upload') => {
+    setLoading(true);
+    setLoadingMsg('Citim emailul original si cautam butoanele sau linkurile ascunse...');
+
+    try {
+      const formData = new FormData();
+      formData.append('source_channel', sourceChannel);
+      await appendUploadToFormData(formData, 'email_file', file);
+
+      const response = await fetch(`${backendUrl}/v1/scan/email`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        throw new Error(responseText || 'Eroare la scanarea emailului original.');
+      }
+
+      const data = await response.json();
+      onScanComplete(data);
+      return true;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitPdfScan = async (file: UploadableFile, sourceChannel = 'pdf_upload') => {
+    setLoading(true);
+    setLoadingMsg('Citim documentul si verificam textul extras...');
+
+    try {
+      const formData = new FormData();
+      formData.append('source_channel', sourceChannel);
+      await appendUploadToFormData(formData, 'pdf_file', file);
+
+      const response = await fetch(`${backendUrl}/v1/scan/pdf`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        throw new Error(responseText || 'Eroare la scanarea PDF-ului.');
+      }
+
+      const data = await response.json();
+      onScanComplete(data);
+      return true;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleQrScanResult = async ({ data }: { data: string; type: string }) => {
+    const scannedValue = data.trim();
+    setIsQrScannerVisible(false);
+
+    if (!scannedValue) {
+      Alert.alert('QR gol', 'Codul scanat nu conține text utilizabil.');
+      return;
+    }
+
+    if (isSingleUrlText(scannedValue)) {
+      await submitUrlScan(scannedValue, 'qr_scan', true, 'Verificăm linkul extras din codul QR...');
+      return;
+    }
+
+    await submitTextScan(scannedValue, 'qr_scan', true, 'Analizăm textul extras din codul QR...');
   };
 
   const handlePickImage = async () => {
@@ -560,54 +936,248 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
 
     if (pickerResult.canceled) return;
 
-    setLoading(true);
-    setLoadingMsg('Extragem textul din screenshot prin OCR...');
-
-    const uri = pickerResult.assets[0].uri;
-    
-    // Check if running on web
-    if (Platform.OS === 'web') {
-      // Simulate file upload or make local mock
-      setTimeout(() => {
-        // Mocking OCR based on selected filename or typical curier scenario
-        simulateOfflineScan("FAN Courier Locker: Coletul tau este pregatit. Ridica de aici: http://fan-locker-ridicare.ru/awb");
-        setLoading(false);
-      }, 1500);
-      return;
-    }
-
-    // Native multipart upload
-    const filename = uri.split('/').pop() || 'screenshot.jpg';
-    const match = /\.(\w+)$/.exec(filename);
-    const type = match ? `image/${match[1]}` : `image/jpeg`;
-
-    const formData = new FormData();
-    // @ts-ignore
-    formData.append('image_file', { uri, name: filename, type });
+    const asset = pickerResult.assets[0] as PickedImageAsset;
+    const uploadable = buildUploadableFile({
+      uri: asset.uri,
+      name: asset.fileName || asset.file?.name || filenameFromUri(asset.uri),
+      type: asset.mimeType || asset.file?.type,
+      webFile: asset.file,
+    });
 
     try {
-      const response = await fetch(`${backendUrl}/v1/scan/image`, {
-        method: 'POST',
-        body: formData,
-        headers: {
-          'Accept': 'application/json',
-        },
+      await submitImageScan(uploadable, Platform.OS === 'web' ? 'web_image_upload' : 'image_upload');
+    } catch (err: any) {
+      console.log(err);
+      Alert.alert('OCR indisponibil', 'Nu s-a putut scana captura reală acum. Afișăm un rezultat parțial, fără demo fals.');
+      showImageScanUnavailableResult(String(err?.message || 'Eroare la scanarea imaginii.'));
+    }
+  };
+
+  const handlePickEmail = async () => {
+    setLoading(true);
+    setLoadingMsg('Citim emailul original si cautam butoanele sau linkurile ascunse...');
+
+    try {
+      const pickerResult = await DocumentPicker.getDocumentAsync({
+        type: ['message/rfc822', 'application/octet-stream', 'text/plain', 'text/html', 'application/vnd.ms-outlook'],
+        copyToCacheDirectory: true,
+        multiple: false,
       });
 
-      if (!response.ok) {
-        throw new Error('Eroare la scanarea imaginii.');
+      if (pickerResult.canceled) {
+        return;
       }
 
-      const data = await response.json();
-      onScanComplete(data);
-    } catch (err) {
+      const asset = pickerResult.assets[0] as PickedDocumentAsset;
+      const filename = asset.name || filenameFromUri(asset.uri, 'email-suspect.eml');
+      const mimeType = normalizeMime(asset.mimeType || asset.file?.type);
+      const uploadable = buildUploadableFile({
+        uri: asset.uri,
+        name: filename,
+        type: mimeType,
+        webFile: asset.file,
+      });
+
+      if (isTextMimeType(mimeType) && !isEmlFilename(filename) && !isHtmlFilename(filename)) {
+        const rawText = await readTextFromUri(asset.uri);
+        if (!rawText?.trim()) {
+          Alert.alert('Fișier text gol', 'Fișierul ales nu conține text de analizat.');
+          return;
+        }
+
+        await submitTextScan(rawText, 'manual_text_file', true, 'Analizăm conținutul textului partajat...');
+        return;
+      }
+
+      if (isHtmlFilename(filename) || isHtmlMimeType(mimeType)) {
+        const htmlText = await readTextFromUri(asset.uri);
+        if (!htmlText?.trim()) {
+          Alert.alert('Fișier HTML gol', 'Nu s-a putut extrage conținutul HTML din fișier.');
+          return;
+        }
+
+        await submitEmailScanFromHtml(htmlText, Platform.OS === 'web' ? 'web_shared_html_upload' : 'shared_html_upload');
+        return;
+      }
+
+      if (!isEmlFilename(filename) && mimeType !== 'message/rfc822' && mimeType !== 'application/vnd.ms-outlook') {
+        Alert.alert(
+          'Format nepotrivit',
+          'Pentru analiza completa a emailului, incarcati fisierul original .eml.'
+        );
+        return;
+      }
+
+      await submitEmailScan(uploadable, Platform.OS === 'web' ? 'web_email_upload' : 'email_upload');
+    } catch (err: any) {
       console.log(err);
-      Alert.alert('Eroare', 'Nu s-a putut trimite screenshot-ul către server. Rulăm analiză locală.');
-      simulateOfflineScan("Posta Romana: Taxa de livrare 2.45 lei neachitata. Achitati pe posta-romana-taxe.top");
+      Alert.alert(
+        'Scanare email indisponibila',
+        `Nu am putut analiza emailul original acum. ${String(err?.message || 'Incercati din nou.')}`
+      );
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!incomingShareRequest?.id) {
+      return;
+    }
+
+    let active = true;
+
+    const handleIncomingShare = async () => {
+      try {
+        const rawPayloads = incomingShareRequest.sharedPayloads || [];
+        const resolvedPayloads = incomingShareRequest.resolvedSharedPayloads || [];
+
+        const firstRawText = rawPayloads.find(
+          (payload: IncomingShareRawPayload) =>
+            (payload.shareType === 'text' || payload.shareType === 'url') && payload.value?.trim()
+        );
+
+        if (firstRawText?.value?.trim()) {
+          const sharedValue = firstRawText.value.trim();
+          if (firstRawText.shareType === 'url' || isSingleUrlText(sharedValue)) {
+            await submitUrlScan(
+              sharedValue,
+              firstRawText.shareType === 'url' ? 'shared_url' : 'shared_text',
+              true,
+              'Verificăm linkul partajat direct din telefon...'
+            );
+          } else {
+            await submitTextScan(
+              sharedValue,
+              firstRawText.shareType === 'text' ? 'shared_text' : 'shared_url',
+              true,
+              'Analizăm mesajul partajat direct din telefon...'
+            );
+          }
+          return;
+        }
+
+        const firstResolved = resolvedPayloads.find(
+          (payload: IncomingShareResolvedPayload) => Boolean(payload.contentUri || payload.value)
+        );
+
+        if (!firstResolved) {
+          Alert.alert('Share gol', 'Nu am primit continut utilizabil din Share Sheet.');
+          return;
+        }
+
+        const sharedUri = firstResolved.contentUri || firstResolved.value;
+        const sharedName =
+          firstResolved.originalName ||
+          filenameFromUri(firstResolved.contentUri || firstResolved.value, 'shared-item');
+        const sharedMime = normalizeMime(firstResolved.contentMimeType || firstResolved.mimeType);
+        const uploadable = buildUploadableFile({
+          uri: sharedUri,
+          name: sharedName,
+          type: sharedMime,
+        });
+
+        if (firstResolved.contentType === 'text' && firstResolved.value?.trim()) {
+          await submitTextScan(
+            firstResolved.value,
+            'shared_text',
+            true,
+            'Analizăm textul partajat direct din telefon...'
+          );
+          return;
+        }
+
+        if (firstResolved.contentType === 'website' && firstResolved.value?.trim()) {
+          const websiteValue = firstResolved.value.trim();
+          if (isSingleUrlText(websiteValue)) {
+            await submitUrlScan(websiteValue, 'shared_url', true, 'Verificăm linkul partajat direct din telefon...');
+          } else {
+            await submitTextScan(
+              websiteValue,
+              'shared_url',
+              true,
+              'Analizăm conținutul web partajat...'
+            );
+          }
+          return;
+        }
+
+        if (firstResolved.contentType === 'image') {
+          await submitImageScan(uploadable, 'shared_image');
+          return;
+        }
+
+        if (isHtmlMimeType(uploadable.type ?? undefined) || isHtmlFilename(uploadable.name)) {
+          const htmlContent = await readSharedTextPayload(firstResolved);
+          if (typeof htmlContent === 'string' && htmlContent.trim()) {
+            await submitEmailScanFromHtml(htmlContent, 'shared_html_file');
+            return;
+          }
+        }
+
+        if (
+          isTextMimeType(uploadable.type ?? undefined) &&
+          !isHtmlMimeType(uploadable.type ?? undefined)
+        ) {
+          const textContent = await readSharedTextPayload(firstResolved);
+          if (typeof textContent === 'string' && textContent.trim()) {
+            await submitTextScan(textContent, 'shared_text_file', true, 'Analizăm conținutul partajat din fișier text...');
+            return;
+          }
+        }
+
+        if (
+          isPdfFilename(uploadable.name) ||
+          uploadable.type === 'application/pdf'
+        ) {
+          await submitPdfScan(uploadable, 'shared_pdf');
+          return;
+        }
+
+        if (isEmlFilename(uploadable.name) || uploadable.type === 'message/rfc822') {
+          await submitEmailScan(uploadable, 'shared_email');
+          return;
+        }
+
+        if (uploadable.type === 'application/vnd.ms-outlook') {
+          const content = await readSharedTextPayload(firstResolved);
+          if (!content?.trim()) {
+            Alert.alert('Fișier .msg incomplet', 'Nu s-a putut extrage text din fișierul Outlook. Încearcă exportul ca .eml.');
+            return;
+          }
+
+          await submitEmailScanFromHtml(content, 'shared_outlook_msg');
+          return;
+        }
+
+        if (uploadable.type === 'text/uri-list' && firstResolved.value?.trim()) {
+          await submitUrlScan(firstResolved.value, 'shared_url', true, 'Verificăm linkul din listă...');
+          return;
+        }
+
+        Alert.alert(
+          'Tip de continut neacoperit',
+          'Momentan putem analiza direct text, linkuri, imagini, PDF și emailuri originale .eml.'
+        );
+      } catch (err: any) {
+        console.log('Failed to process incoming share', err);
+        Alert.alert(
+          'Share indisponibil',
+          `Nu am putut procesa acest continut partajat. ${String(err?.message || 'Incearca din nou.')}`
+        );
+      } finally {
+        if (active) {
+          onIncomingShareHandled?.();
+        }
+      }
+    };
+
+    handleIncomingShare();
+
+    return () => {
+      active = false;
+    };
+  }, [incomingShareRequest?.id]);
 
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
@@ -630,7 +1200,19 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
           <Text style={styles.cardTitle}>Introduceți mesajul sau linkul suspect</Text>
           <Text style={styles.cardSubtitle}>
             Copiați un SMS, WhatsApp, e-mail sau link primit și lipiți-l mai jos.
+            Pentru emailuri cu butoane, încărcați emailul original `.eml`.
           </Text>
+
+              {Platform.OS !== 'web' && (
+            <View style={styles.shareHintCard}>
+              <Text style={styles.shareHintTitle}>Pe telefon: trimite direct cu Share</Text>
+              <Text style={styles.shareHintText}>
+                Din SMS/Gmail/WhatsApp: apasă `Share` → alege `NuDaClick` → analizăm automat.
+                Funcționează pe linkuri (`URL`) și fișiere (`.eml`, `.html`, PDF, imagini).
+                Dacă mesajul are buton „Apasă aici”, trimite `.eml` originalul pentru a vedea linkul ascuns.
+              </Text>
+            </View>
+          )}
 
           <View style={styles.inputWrapper}>
             <TextInput
@@ -669,14 +1251,28 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
               <Text style={styles.gridButtonDesc}>Analiză text & OCR</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity 
-              style={styles.gridButton} 
-              onPress={() => simulateOfflineScan("QR Code scan: http://anaf-spv-plati.info/plata-rapida")}
+            <TouchableOpacity style={styles.gridButton} onPress={handlePickEmail}>
+              <Mail size={24} color="#F59E0B" />
+              <Text style={styles.gridButtonTitle}>Încarcă Email</Text>
+              <Text style={styles.gridButtonDesc}>Original .eml</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.gridButton}
+              onPress={() => setIsQrScannerVisible(true)}
             >
               <QrCode size={24} color="#10B981" />
               <Text style={styles.gridButtonTitle}>Scanează QR</Text>
-              <Text style={styles.gridButtonDesc}>Arată linkul ascuns</Text>
+              <Text style={styles.gridButtonDesc}>Scanare live cu camera</Text>
             </TouchableOpacity>
+          </View>
+
+          <View style={styles.emailHintCard}>
+            <Text style={styles.emailHintTitle}>Email cu buton suspect?</Text>
+            <Text style={styles.emailHintText}>
+              Dacă vezi doar un buton de tip „Apasă aici”, poza nu ne arată mereu linkul real. Fișierul `.eml`
+              ne lasă să verificăm adresa ascunsă din spatele butonului.
+            </Text>
           </View>
           
           <View style={styles.noticeContainer}>
@@ -686,6 +1282,12 @@ export default function ScanScreen({ onScanComplete, backendUrl }: ScanScreenPro
           </View>
         </View>
       )}
+
+      <QRScannerModal
+        visible={isQrScannerVisible}
+        onClose={() => setIsQrScannerVisible(false)}
+        onScan={handleQrScanResult}
+      />
     </ScrollView>
   );
 }
@@ -824,10 +1426,12 @@ const styles = StyleSheet.create({
   grid: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    rowGap: 12,
     marginBottom: 16,
   },
   gridButton: {
-    flex: 0.48,
+    width: '48%',
     backgroundColor: 'rgba(11, 15, 25, 0.5)',
     borderRadius: 12,
     borderWidth: 1,
@@ -846,6 +1450,44 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     fontSize: 10,
     marginTop: 2,
+  },
+  emailHintCard: {
+    backgroundColor: 'rgba(245, 158, 11, 0.06)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(245, 158, 11, 0.16)',
+    padding: 12,
+    marginBottom: 12,
+  },
+  emailHintTitle: {
+    color: '#F9FAFB',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  emailHintText: {
+    color: '#D1D5DB',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  shareHintCard: {
+    backgroundColor: 'rgba(16, 185, 129, 0.06)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.18)',
+    padding: 12,
+    marginBottom: 12,
+  },
+  shareHintTitle: {
+    color: '#F9FAFB',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  shareHintText: {
+    color: '#D1D5DB',
+    fontSize: 12,
+    lineHeight: 18,
   },
   noticeContainer: {
     backgroundColor: 'rgba(59, 130, 246, 0.05)',

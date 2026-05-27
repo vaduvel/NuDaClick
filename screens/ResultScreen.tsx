@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,6 +8,8 @@ import {
   Share,
   Platform,
   Alert,
+  TextInput,
+  ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { 
@@ -21,18 +23,29 @@ import {
   ChevronRight,
   Flame
 } from 'lucide-react-native';
+import { getDisplayRiskBadgeLabel, getDisplayRiskToken, normalizeRiskLevelForDisplay } from '../theme';
 
 interface ResultScreenProps {
   result: any;
   onBack: () => void;
   onNavigateToTriage: (preselectCategory?: string) => void;
+  backendUrl: string;
 }
 
-export default function ResultScreen({ result, onBack, onNavigateToTriage }: ResultScreenProps) {
+export default function ResultScreen({
+  result,
+  onBack,
+  onNavigateToTriage,
+  backendUrl,
+}: ResultScreenProps) {
   const {
     scan_id,
     risk_score = 0,
     risk_level = 'low',
+    user_risk_level,
+    user_risk_label,
+    user_risk_text,
+    user_recommended_action,
     detected_family = 'Nespecificat',
     claimed_brand = 'Nespecificat',
     reasons = [],
@@ -43,8 +56,57 @@ export default function ResultScreen({ result, onBack, onNavigateToTriage }: Res
     ai_explanation = '',
     key_dangers = [],
     safe_actions = [],
-    warning = ''
+    warning = '',
+    signal_ids = [],
+    buttons = [],
+    resolved_urls = [],
+    subject = '',
+    from = '',
+    reply_to = '',
+    is_forwarded_warning = false,
   } = result;
+
+  const riskDisplayLevel = normalizeRiskLevelForDisplay(user_risk_level || risk_level);
+  const riskDisplayToken = getDisplayRiskToken(riskDisplayLevel);
+  const feedbackStorageKey = `scamshield_feedback_${scan_id}`;
+  const predictedIsScam = riskDisplayLevel === 'dangerous' || riskDisplayLevel === 'suspect';
+  const parsedSignalIds = Array.isArray(signal_ids)
+    ? signal_ids.filter((value) => typeof value === 'string')
+    : [];
+  const parsedRiskScore = Number.isFinite(Number(risk_score)) ? Number(risk_score) : 0;
+  const emailAuth = (evidence as { email_auth?: any } | null | undefined)?.email_auth;
+  const authStatus = emailAuth?.auth_status || {};
+  const dnsChecks = emailAuth?.dns_checks || {};
+  const authActionPlan = emailAuth?.auth_action_plan;
+  const authFailReasons = Array.isArray(emailAuth?.auth_fail_reasons)
+    ? emailAuth.auth_fail_reasons
+    : [];
+  const hasEmailAuthContext = Boolean(emailAuth);
+  const parsedButtons = Array.isArray(buttons) ? buttons : [];
+  const linkEvidence =
+    Array.isArray((evidence as { extracted_urls?: any[] } | null | undefined)?.extracted_urls) &&
+    (evidence as { extracted_urls?: any[] }).extracted_urls!.length > 0
+      ? (evidence as { extracted_urls?: any[] }).extracted_urls!
+      : Array.isArray(resolved_urls)
+      ? resolved_urls
+      : [];
+
+  const formatRedirectHop = (hop: any) => {
+    if (typeof hop === 'string') {
+      return hop;
+    }
+    if (hop && typeof hop === 'object') {
+      return hop.url || hop.final_url || hop.hostname || hop.registered_domain || JSON.stringify(hop);
+    }
+    return String(hop || '');
+  };
+
+  type FeedbackChoice = 'correct' | 'false_positive' | 'false_negative';
+
+  const [submittedFeedback, setSubmittedFeedback] = useState<FeedbackChoice | null>(null);
+  const [feedbackNotes, setFeedbackNotes] = useState('');
+  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState('');
 
   // Save the result to history when this screen mounts
   useEffect(() => {
@@ -61,6 +123,8 @@ export default function ResultScreen({ result, onBack, onNavigateToTriage }: Res
             timestamp: new Date().toISOString(),
             risk_score,
             risk_level,
+            user_risk_level: user_risk_level || riskDisplayLevel,
+            user_risk_label: user_risk_label || getDisplayRiskBadgeLabel(riskDisplayLevel),
             detected_family,
             claimed_brand,
             text_preview: redacted_text || ocr_extracted_text || 'Scanare link direct',
@@ -77,52 +141,134 @@ export default function ResultScreen({ result, onBack, onNavigateToTriage }: Res
     saveToHistory();
   }, [scan_id]);
 
-  // Determine colors based on risk level mapping to EPIC-06 (SIGUR, SUSPECT, PERICULOS, NECUNOSCUT)
+  const feedbackOptions: Array<{ value: FeedbackChoice; label: string; description: string; color: string }> = [
+    {
+      value: 'correct',
+      label: 'Corect',
+      description: 'Verdictul este corect',
+      color: '#10B981',
+    },
+    {
+      value: 'false_positive',
+      label: 'Fals Pozitiv',
+      description: 'A fost semnalat ca scam, dar era sigur',
+      color: '#F59E0B',
+    },
+    {
+      value: 'false_negative',
+      label: 'Fals Negativ',
+      description: 'Ar fi trebuit să fie semnalat ca scam',
+      color: '#EF4444',
+    },
+  ];
+
+  useEffect(() => {
+    const loadStoredFeedback = async () => {
+      try {
+        const raw = await AsyncStorage.getItem(feedbackStorageKey);
+        if (!raw) {
+          return;
+        }
+
+        const parsed = JSON.parse(raw) as { feedback?: FeedbackChoice; notes?: string };
+        if (parsed.feedback) {
+          setSubmittedFeedback(parsed.feedback);
+        }
+        if (typeof parsed.notes === 'string') {
+          setFeedbackNotes(parsed.notes);
+        }
+      } catch (err) {
+        console.error('Error loading stored feedback', err);
+      }
+    };
+    loadStoredFeedback();
+  }, [feedbackStorageKey]);
+
+  const submitFeedback = async (feedbackValue: FeedbackChoice) => {
+    setIsSubmittingFeedback(true);
+    setFeedbackMessage('');
+
+    try {
+      const response = await fetch(`${backendUrl}/v1/feedback`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          scan_id,
+          feedback: feedbackValue,
+          actual_is_scam:
+            feedbackValue === 'false_positive'
+              ? false
+              : feedbackValue === 'false_negative'
+              ? true
+              : predictedIsScam,
+          predicted_is_scam: predictedIsScam,
+          predicted_risk_score: parsedRiskScore,
+          risk_level: user_risk_level || risk_level,
+          signal_ids: parsedSignalIds,
+          notes: feedbackNotes.trim() || undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        const responseText = await response.text().catch(() => '');
+        throw new Error(responseText || 'Nu s-a putut trimite feedback-ul');
+      }
+
+      const savedPayload = {
+        feedback: feedbackValue,
+        notes: feedbackNotes.trim(),
+        submitted_at: new Date().toISOString(),
+      };
+      await AsyncStorage.setItem(feedbackStorageKey, JSON.stringify(savedPayload));
+      setSubmittedFeedback(feedbackValue);
+      setFeedbackMessage('Mulțumim! Feedback-ul a fost trimis și ajută recalibrarea modelului anti-fraudă.');
+    } catch (err: any) {
+      setFeedbackMessage(
+        `Nu s-a putut trimite feedback-ul automat. Încearcă din nou. (${String(err?.message || 'Eroare')})`
+      );
+    } finally {
+      setIsSubmittingFeedback(false);
+    }
+  };
+
+  // Determine colors based on user-facing risk model (SIGUR, SUSPECT, PERICULOS, NECUNOSCUT)
   const getRiskDetails = () => {
-    switch (risk_level.toLowerCase()) {
-      case 'critical':
+    switch (riskDisplayLevel) {
+      case 'dangerous':
         return {
-          color: '#EF4444', // red
+          color: riskDisplayToken.main,
           bgGradient: ['#3A1313', '#1F0B0B'],
-          borderColor: 'rgba(239, 68, 68, 0.4)',
-          badgeText: 'PERICULOS',
+          borderColor: `${riskDisplayToken.border}`,
+          badgeText: user_risk_label || getDisplayRiskBadgeLabel(riskDisplayLevel),
           description: 'Acesta este cu siguranță un atac cibernetic activ. Nu introduceți date, coduri sau carduri!',
           icon: <ShieldAlert size={48} color="#EF4444" />
         };
-      case 'high':
+      case 'suspect':
         return {
-          color: '#F59E0B', // amber
-          bgGradient: ['#38240D', '#1F1407'],
-          borderColor: 'rgba(245, 158, 11, 0.4)',
-          badgeText: 'PERICULOS',
-          description: 'Mesajul prezintă anomalii grave și se folosește de branduri oficiale în mod nelegitim.',
-          icon: <AlertTriangle size={48} color="#F59E0B" />
-        };
-      case 'medium':
-        return {
-          color: '#EAB308', // yellow
+          color: riskDisplayToken.main,
           bgGradient: ['#312E0D', '#1F1E07'],
-          borderColor: 'rgba(234, 179, 8, 0.3)',
-          badgeText: 'SUSPECT',
+          borderColor: `${riskDisplayToken.border}`,
+          badgeText: user_risk_label || getDisplayRiskBadgeLabel(riskDisplayLevel),
           description: 'Atenție! Unele elemente nu pot fi verificate complet sau par suspicioase.',
           icon: <AlertTriangle size={48} color="#EAB308" />
         };
-      case 'low':
       case 'safe':
         return {
-          color: '#10B981', // emerald
+          color: riskDisplayToken.main,
           bgGradient: ['#0C291E', '#061711'],
-          borderColor: 'rgba(16, 185, 129, 0.4)',
-          badgeText: 'SIGUR',
+          borderColor: `${riskDisplayToken.border}`,
+          badgeText: user_risk_label || getDisplayRiskBadgeLabel(riskDisplayLevel),
           description: 'Nu au fost identificate elemente cunoscute de fraudă. Totuși, rămâneți mereu vigilent.',
           icon: <CheckCircle2 size={48} color="#10B981" />
         };
       default:
         return {
-          color: '#3B82F6', // blue
+          color: riskDisplayToken.main,
           bgGradient: ['#111E36', '#0B111E'],
-          borderColor: 'rgba(59, 130, 246, 0.3)',
-          badgeText: 'NECUNOSCUT',
+          borderColor: `${riskDisplayToken.border}`,
+          badgeText: user_risk_label || getDisplayRiskBadgeLabel(riskDisplayLevel),
           description: 'Nu s-a putut stabili o conexiune clară cu un scam cunoscut.',
           icon: <HelpCircle size={48} color="#3B82F6" />
         };
@@ -133,8 +279,8 @@ export default function ResultScreen({ result, onBack, onNavigateToTriage }: Res
 
   const handleShare = async () => {
     try {
-      const shareMessage = `ScamShield RO / NuDaClick Raport:
-Scor Risc: ${risk_score}/100 [${risk.badgeText}]
+  const shareMessage = `ScamShield RO / NuDaClick Raport:
+Status: ${risk.badgeText}
 Familie de Scam: ${detected_family}
 Brand Mimic: ${claimed_brand}
 
@@ -193,9 +339,9 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
       <View style={[styles.riskCard, { borderColor: risk.borderColor, backgroundColor: risk.bgGradient[0] }]}>
         <View style={styles.riskHeader}>
           {risk.icon}
-          <View style={styles.scoreContainer}>
-            <Text style={[styles.scoreNumber, { color: risk.color }]}>{risk_score}</Text>
-            <Text style={styles.scoreMax}>/100</Text>
+          <View style={styles.statusBanner}>
+            <Text style={[styles.statusBannerLabel, { color: risk.color }]}>STATUS</Text>
+            <Text style={[styles.statusBannerValue, { color: risk.color }]}>{risk.badgeText}</Text>
           </View>
         </View>
 
@@ -204,6 +350,11 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
             <Text style={[styles.badgeLabel, { color: risk.color }]}>{risk.badgeText}</Text>
           </View>
         </View>
+
+        {user_risk_text ? <Text style={styles.riskText}>{user_risk_text}</Text> : null}
+        {user_recommended_action ? (
+          <Text style={styles.riskRecommendation}>{user_recommended_action}</Text>
+        ) : null}
 
         <Text style={styles.familyText}>Familie scam: <Text style={{ fontWeight: 'bold', color: '#FFF' }}>{detected_family}</Text></Text>
         <Text style={styles.brandText}>Brand clonat: <Text style={[styles.brandHighlight, { color: risk.color }]}>{claimed_brand}</Text></Text>
@@ -216,6 +367,36 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
         <View style={styles.warningAlert}>
           <Text style={styles.warningAlertTitle}>⚠️ Avertisment OCR / Captură ecran</Text>
           <Text style={styles.warningAlertText}>{warning || result.warning}</Text>
+        </View>
+      )}
+
+      {(subject || from || reply_to || is_forwarded_warning) && (
+        <View style={styles.glassCard}>
+          <Text style={styles.sectionTitle}>📧 Email analizat</Text>
+          {subject ? (
+            <View style={styles.metaRow}>
+              <Text style={styles.metaLabel}>Subiect</Text>
+              <Text style={styles.metaValue}>{subject}</Text>
+            </View>
+          ) : null}
+          {from ? (
+            <View style={styles.metaRow}>
+              <Text style={styles.metaLabel}>De la</Text>
+              <Text style={styles.metaValue}>{from}</Text>
+            </View>
+          ) : null}
+          {reply_to ? (
+            <View style={styles.metaRow}>
+              <Text style={styles.metaLabel}>Reply-To</Text>
+              <Text style={styles.metaValue}>{reply_to}</Text>
+            </View>
+          ) : null}
+          {is_forwarded_warning ? (
+            <Text style={styles.metaWarning}>
+              Emailul pare forwardat sau copiat fără toate antetele originale. Linkurile pot fi verificate,
+              dar autentificarea SPF/DKIM/DMARC poate fi doar parțială.
+            </Text>
+          ) : null}
         </View>
       )}
 
@@ -250,10 +431,76 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
         </View>
       )}
 
-      {/* Reasons for risk scoring */}
+      {/* SPF/DKIM/DMARC advanced checks */}
+      {hasEmailAuthContext && (
+        <View style={styles.glassCard}>
+          <Text style={styles.sectionTitle}>📨 Verificare SPF / DKIM / DMARC</Text>
+
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>Status autentificare</Text>
+            <Text style={[styles.authValue, { color: risk.color }]}>
+              {(emailAuth?.auth_strength || 'unknown').toString().toUpperCase()}
+            </Text>
+          </View>
+
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>SPF</Text>
+            <Text style={[styles.authValue, { color: authStatus?.spf === 'pass' ? '#10B981' : '#EF4444' }]}>
+              {String(authStatus?.spf || 'missing').toUpperCase()}
+            </Text>
+          </View>
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>DKIM</Text>
+            <Text
+              style={[styles.authValue, { color: authStatus?.dkim === 'pass' ? '#10B981' : '#EF4444' }]}
+            >
+              {String(authStatus?.dkim || 'missing').toUpperCase()}
+            </Text>
+          </View>
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>DMARC</Text>
+            <Text
+              style={[styles.authValue, { color: authStatus?.dmarc === 'pass' ? '#10B981' : '#EF4444' }]}
+            >
+              {String(authStatus?.dmarc || 'missing').toUpperCase()}
+            </Text>
+          </View>
+
+          <Text style={styles.authSubTitle}>Politici DNS</Text>
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>SPF DNS</Text>
+            <Text style={styles.authValue}>{dnsChecks?.spf_record ? 'Disponibil' : 'Nedetectat'}</Text>
+          </View>
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>DKIM DNS</Text>
+            <Text style={styles.authValue}>{dnsChecks?.dkim_dns ? 'Disponibil' : 'Nedetectat'}</Text>
+          </View>
+          <View style={styles.authRow}>
+            <Text style={styles.authLabel}>DMARC DNS</Text>
+            <Text style={styles.authValue}>{dnsChecks?.dmarc_policy ? 'Disponibil' : 'Nedetectat'}</Text>
+          </View>
+
+          <Text style={styles.authSubTitle}>Plan de acțiune generat</Text>
+          <Text style={styles.actionText}>
+            {authActionPlan?.action ? `Acțiune: ${String(authActionPlan.action).toUpperCase()}` : 'Acțiune: monitor'}
+          </Text>
+
+          <View style={styles.authReasonList}>
+            {(authFailReasons.length > 0 ? authFailReasons : authActionPlan?.reasons || []).map(
+              (reason: string, index: number) => (
+                <Text key={index} style={styles.bulletItem}>
+                  • {reason}
+                </Text>
+              )
+            )}
+          </View>
+        </View>
+      )}
+
+      {/* Reasons detected */}
       {reasons.length > 0 && (
         <View style={styles.glassCard}>
-          <Text style={styles.sectionTitle}>🔍 Semnale de Alarmă Detectate</Text>
+          <Text style={styles.sectionTitle}>🔍 Semnale detectate</Text>
           {reasons.map((reason: string, index: number) => (
             <View key={index} style={styles.reasonRow}>
               <View style={[styles.dot, { backgroundColor: risk.color }]} />
@@ -263,13 +510,95 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
         </View>
       )}
 
+      {parsedButtons.length > 0 && (
+        <View style={styles.glassCard}>
+          <Text style={styles.sectionTitle}>🔘 Butoane și linkuri ascunse</Text>
+          <Text style={styles.subtitleText}>
+            Am extras din email adresa reală din spatele butoanelor pe care utilizatorul le-ar apăsa.
+          </Text>
+
+          {parsedButtons.map((button: any, index: number) => {
+            const resolvedButtonUrl = button.final_url || button.original_url || 'Necunoscut';
+            return (
+              <View key={index} style={styles.buttonEvidenceCard}>
+                <View style={styles.buttonEvidenceHeader}>
+                  <Text style={styles.buttonEvidenceTitle}>
+                    Buton #{index + 1}: {button.button_text || '[Fără text]'}
+                  </Text>
+                  {button.is_sensitive_cta ? (
+                    <View style={styles.buttonRiskBadge}>
+                      <Text style={styles.buttonRiskBadgeText}>CTA sensibil</Text>
+                    </View>
+                  ) : null}
+                </View>
+
+                <Text style={styles.buttonEvidenceLabel}>Link real</Text>
+                <Text style={styles.buttonEvidenceValue}>{resolvedButtonUrl}</Text>
+
+                {button.registered_domain ? (
+                  <>
+                    <Text style={styles.buttonEvidenceLabel}>Domeniu</Text>
+                    <Text style={styles.buttonEvidenceValue}>{button.registered_domain}</Text>
+                  </>
+                ) : null}
+              </View>
+            );
+          })}
+        </View>
+      )}
+
+      {/* Feedback Loop */}
+      <View style={styles.feedbackCard}>
+        <Text style={styles.sectionTitle}>🧪 Verificare Feedback (Învățare continuă)</Text>
+        <Text style={styles.feedbackDescription}>Confirmă dacă verdictul e corect pentru a ne ajuta să reducem erorile.</Text>
+
+        <View style={styles.feedbackOptions}>
+          {feedbackOptions.map((option) => {
+            const selected = submittedFeedback === option.value;
+            return (
+              <TouchableOpacity
+                key={option.value}
+                style={[
+                  styles.feedbackOption,
+                  { borderColor: selected ? option.color : '#374151', backgroundColor: selected ? `${option.color}20` : '#0F172A' },
+                ]}
+                onPress={() => submitFeedback(option.value)}
+                disabled={isSubmittingFeedback}
+              >
+                <Text style={[styles.feedbackOptionLabel, { color: option.color }]}>{option.label}</Text>
+                <Text style={styles.feedbackOptionDescription}>{option.description}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        <TextInput
+          style={styles.feedbackNotes}
+          placeholder="Opțional: adaugă detalii (ex: link, context)"
+          placeholderTextColor="#6B7280"
+          value={feedbackNotes}
+          onChangeText={setFeedbackNotes}
+          multiline
+          numberOfLines={3}
+          textAlignVertical="top"
+        />
+
+        {isSubmittingFeedback ? (
+          <ActivityIndicator size="small" color="#3B82F6" />
+        ) : submittedFeedback && feedbackMessage ? (
+          <Text style={styles.feedbackSuccessMessage}>{feedbackMessage}</Text>
+        ) : submittedFeedback ? (
+          <Text style={styles.feedbackSuccessMessage}>Feedback trimis. Mulțumim.</Text>
+        ) : null}
+      </View>
+
       {/* Redirect Chain / Domain Evidence */}
-      {evidence && evidence.extracted_urls && evidence.extracted_urls.length > 0 && (
+      {linkEvidence.length > 0 && (
         <View style={styles.glassCard}>
           <Text style={styles.sectionTitle}>🔗 Analiză Link-uri & Redirecționări</Text>
           <Text style={styles.subtitleText}>Urmărirea redirecționărilor a arătat următoarele destinații:</Text>
           
-          {evidence.extracted_urls.map((urlInfo: any, idx: number) => {
+          {linkEvidence.map((urlInfo: any, idx: number) => {
             const isMatch = urlInfo.domain_legitimacy === 'official';
             const isPhish = urlInfo.domain_legitimacy === 'mismatch';
             const badgeColor = isMatch ? '#10B981' : isPhish ? '#EF4444' : '#9CA3AF';
@@ -283,9 +612,9 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
                 {urlInfo.redirect_chain && urlInfo.redirect_chain.length > 0 && (
                   <View style={styles.redirectChain}>
                     <Text style={styles.redirectChainTitle}>Lanț redirecționare:</Text>
-                    {urlInfo.redirect_chain.map((hop: string, hopIdx: number) => (
+                    {urlInfo.redirect_chain.map((hop: any, hopIdx: number) => (
                       <View key={hopIdx} style={styles.chainHop}>
-                        <Text style={styles.hopText}>{hop}</Text>
+                        <Text style={styles.hopText}>{formatRedirectHop(hop)}</Text>
                         {hopIdx < urlInfo.redirect_chain.length - 1 && (
                           <ChevronRight size={12} color="#6B7280" style={{ marginHorizontal: 4 }} />
                         )}
@@ -327,7 +656,7 @@ Nu cădea în plasă! Verifică link-urile suspecte cu aplicația NuDaClick.`;
       )}
 
       {/* Triage Call to Action */}
-      {risk_level !== 'low' && (
+      {riskDisplayLevel !== 'safe' && (
         <View style={[styles.triageCard, { borderColor: 'rgba(239, 68, 68, 0.2)' }]}>
           <Flame size={28} color="#EF4444" style={{ marginBottom: 8 }} />
           <Text style={styles.triageTitle}>Ai apăsat deja pe link sau ai introdus date?</Text>
@@ -407,18 +736,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16,
   },
-  scoreContainer: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
+  statusBanner: {
+    alignItems: 'flex-end',
   },
-  scoreNumber: {
+  statusBannerLabel: {
+    color: '#9CA3AF',
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.7,
+    marginBottom: 2,
+  },
+  statusBannerValue: {
     fontSize: 48,
     fontWeight: '900',
-  },
-  scoreMax: {
-    fontSize: 18,
-    color: '#6B7280',
-    fontWeight: '600',
+    letterSpacing: -1,
   },
   badgeRow: {
     flexDirection: 'row',
@@ -448,6 +779,18 @@ const styles = StyleSheet.create({
   brandHighlight: {
     fontWeight: 'bold',
   },
+  riskText: {
+    color: '#F9FAFB',
+    fontSize: 22,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  riskRecommendation: {
+    color: '#D1D5DB',
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 12,
+  },
   riskDescription: {
     color: '#D1D5DB',
     fontSize: 14,
@@ -472,6 +815,28 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
   },
+  metaRow: {
+    marginBottom: 10,
+  },
+  metaLabel: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginBottom: 2,
+  },
+  metaValue: {
+    color: '#F9FAFB',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  metaWarning: {
+    color: '#FBBF24',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 4,
+  },
   glassCard: {
     backgroundColor: 'rgba(22, 30, 49, 0.6)',
     borderWidth: 1,
@@ -479,6 +844,37 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 20,
     marginBottom: 20,
+  },
+  authSubTitle: {
+    color: '#FFF',
+    fontSize: 13,
+    fontWeight: 'bold',
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  authRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  authLabel: {
+    color: '#9CA3AF',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  authValue: {
+    color: '#F9FAFB',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  authReasonList: {
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    padding: 10,
+    marginTop: 10,
   },
   sectionTitle: {
     color: '#FFF',
@@ -539,6 +935,102 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     flex: 1,
+  },
+  buttonEvidenceCard: {
+    backgroundColor: 'rgba(11, 15, 25, 0.5)',
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.05)',
+  },
+  buttonEvidenceHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+    gap: 8,
+  },
+  buttonEvidenceTitle: {
+    color: '#F9FAFB',
+    fontSize: 14,
+    fontWeight: '700',
+    flex: 1,
+  },
+  buttonRiskBadge: {
+    backgroundColor: 'rgba(239, 68, 68, 0.12)',
+    borderColor: 'rgba(239, 68, 68, 0.24)',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  buttonRiskBadgeText: {
+    color: '#FCA5A5',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  buttonEvidenceLabel: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginBottom: 2,
+  },
+  buttonEvidenceValue: {
+    color: '#D1D5DB',
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 8,
+  },
+  feedbackCard: {
+    backgroundColor: 'rgba(30, 41, 59, 0.55)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 20,
+  },
+  feedbackDescription: {
+    color: '#9CA3AF',
+    fontSize: 13,
+    marginBottom: 12,
+  },
+  feedbackOptions: {
+    marginBottom: 12,
+  },
+  feedbackOption: {
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 8,
+  },
+  feedbackOptionLabel: {
+    fontWeight: 'bold',
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  feedbackOptionDescription: {
+    color: '#9CA3AF',
+    fontSize: 12,
+  },
+  feedbackNotes: {
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderRadius: 12,
+    minHeight: 72,
+    padding: 10,
+    color: '#F9FAFB',
+    fontSize: 13,
+    marginBottom: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.2)',
+  },
+  feedbackSuccessMessage: {
+    color: '#34D399',
+    marginTop: 6,
+    fontSize: 12,
+    fontWeight: '600',
   },
   subtitleText: {
     color: '#9CA3AF',

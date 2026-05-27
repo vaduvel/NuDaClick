@@ -1,19 +1,19 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Colors, Typography, Radius, Shadow } from '../theme';
-import { getRiskToken, getRiskBadgeLabel } from '../theme';
+import { getDisplayRiskToken } from '../theme';
 
 interface DSRiskOrbProps {
   /** The 0-100 score value */
   score: number;
-  /** risk_level string: 'critical' | 'high' | 'medium' | 'low' | 'safe' */
+  /** risk_level string: internal or user-facing value */
   level: string;
   /** Size of the outer ring in px (default 120) */
   size?: number;
 }
 
 export default function DSRiskOrb({ score, level, size = 120 }: DSRiskOrbProps) {
-  const tok         = getRiskToken(level);
+  const tok         = getDisplayRiskToken(level);
   const ringSize    = size;
   const innerSize   = ringSize - 16;
   const borderW     = 3;

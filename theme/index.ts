@@ -277,6 +277,40 @@ export const Motion = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+export type UserRiskLevel = 'safe' | 'suspect' | 'dangerous' | 'unknown';
+export type UserRiskLabel = 'SIGUR' | 'SUSPECT' | 'PERICULOS' | 'NECUNOSCUT';
+
+const USER_RISK_LABELS: Record<UserRiskLevel, UserRiskLabel> = {
+  safe: 'SIGUR',
+  suspect: 'SUSPECT',
+  dangerous: 'PERICULOS',
+  unknown: 'NECUNOSCUT',
+};
+
+/**
+ * Normalize internal risk levels to UI-facing categories:
+ * - safe: low/safe
+ * - suspect: medium
+ * - dangerous: high/critical
+ * - unknown: everything else
+ */
+export function normalizeRiskLevelForDisplay(level: string): UserRiskLevel {
+  switch ((level || '').toLowerCase()) {
+    case 'critical':
+    case 'high':
+    case 'dangerous':
+      return 'dangerous';
+    case 'medium':
+    case 'suspect':
+      return 'suspect';
+    case 'low':
+    case 'safe':
+      return 'safe';
+    default:
+      return 'unknown';
+  }
+}
+
 /**
  * Returns the correct risk color token object for a given risk_level string.
  * Handles: 'critical', 'high', 'medium', 'low', 'safe', anything else → unknown
@@ -285,8 +319,10 @@ export function getRiskToken(level: string) {
   switch (level?.toLowerCase()) {
     case 'critical':
     case 'high':
+    case 'dangerous':
       return Colors.risk.high;
     case 'medium':
+    case 'suspect':
       return Colors.risk.medium;
     case 'low':
     case 'safe':
@@ -299,4 +335,14 @@ export function getRiskToken(level: string) {
 /** Returns the Romanian badge label for a given risk_level string. */
 export function getRiskBadgeLabel(level: string): string {
   return getRiskToken(level).badge;
+}
+
+/** Returns risk color token using the UI-facing 3-level model. */
+export function getDisplayRiskToken(level: string) {
+  return getRiskToken(normalizeRiskLevelForDisplay(level));
+}
+
+/** Returns the Romanian badge label for a given risk level (safe/suspect/dangerous/unknown). */
+export function getDisplayRiskBadgeLabel(level: string): string {
+  return USER_RISK_LABELS[normalizeRiskLevelForDisplay(level)];
 }
